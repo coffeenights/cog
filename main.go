@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -58,6 +59,7 @@ type model struct {
 	currentConvID   string
 	convList        list.Model
 	client          *openai.Client
+	db              *Database
 	loading         bool
 	err             error
 	ready           bool
@@ -138,9 +140,37 @@ func initialModel() model {
 
 	client := openai.NewClient(os.Getenv("OPENAI_API_KEY"))
 
-	// Create initial conversation
-	initialConv := newConversation("New Chat")
-	conversations := []Conversation{initialConv}
+	// Initialize database
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatal("Failed to get user home directory:", err)
+	}
+	dbPath := filepath.Join(homeDir, ".cog", "conversations.db")
+	
+	// Create directory if it doesn't exist
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
+		log.Fatal("Failed to create database directory:", err)
+	}
+
+	db, err := NewDatabase(dbPath)
+	if err != nil {
+		log.Fatal("Failed to initialize database:", err)
+	}
+
+	// Load conversations from database
+	conversations, err := db.LoadConversations()
+	if err != nil {
+		log.Fatal("Failed to load conversations:", err)
+	}
+
+	// If no conversations exist, create a default one
+	if len(conversations) == 0 {
+		initialConv := newConversation("New Chat")
+		conversations = []Conversation{initialConv}
+		if err := db.SaveConversation(initialConv); err != nil {
+			log.Printf("Failed to save initial conversation: %v", err)
+		}
+	}
 
 	// Set up conversation list
 	items := make([]list.Item, len(conversations))
@@ -154,13 +184,20 @@ func initialModel() model {
 	convList.SetFilteringEnabled(false)
 	convList.SetShowHelp(false)
 
+	// Set current conversation to the first one
+	var currentConvID string
+	if len(conversations) > 0 {
+		currentConvID = conversations[0].ID
+	}
+
 	m := model{
 		textarea:      ta,
 		viewport:      vp,
 		conversations: conversations,
-		currentConvID: initialConv.ID,
+		currentConvID: currentConvID,
 		convList:      convList,
 		client:        client,
+		db:            db,
 		loading:       false,
 		err:           nil,
 		ready:         false,
@@ -219,6 +256,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			newConv := newConversation("New Chat")
 			m.conversations = append(m.conversations, newConv)
 			m.currentConvID = newConv.ID
+			
+			// Save to database
+			if err := m.db.SaveConversation(newConv); err != nil {
+				m.err = fmt.Errorf("failed to save conversation: %v", err)
+			}
+			
 			m.updateConversationList()
 			m.updateViewport()
 			m.focus = focusChat
@@ -252,6 +295,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							}
 							m.conversations[i].Name = title
 						}
+						
+						// Save to database
+						if err := m.db.SaveConversation(m.conversations[i]); err != nil {
+							m.err = fmt.Errorf("failed to save conversation: %v", err)
+						}
 						break
 					}
 				}
@@ -278,6 +326,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			for i := range m.conversations {
 				if m.conversations[i].ID == m.currentConvID {
 					m.conversations[i].Messages = append(m.conversations[i].Messages, assistantMsg)
+					
+					// Save to database
+					if err := m.db.SaveConversation(m.conversations[i]); err != nil {
+						m.err = fmt.Errorf("failed to save conversation: %v", err)
+					}
 					break
 				}
 			}
@@ -451,7 +504,10 @@ func main() {
 		log.Fatal("OPENAI_API_KEY environment variable is required")
 	}
 
-	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
+	model := initialModel()
+	defer model.db.Close()
+
+	p := tea.NewProgram(model, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		log.Fatal(err)
 	}
