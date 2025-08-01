@@ -7,7 +7,9 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
+	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -21,14 +23,48 @@ type Message struct {
 	Time    time.Time
 }
 
+type Conversation struct {
+	ID       string
+	Name     string
+	Messages []Message
+	Created  time.Time
+}
+
+func (c Conversation) FilterValue() string { return c.Name }
+func (c Conversation) Title() string       { return c.Name }
+func (c Conversation) Description() string {
+	if len(c.Messages) == 0 {
+		return "New conversation"
+	}
+	lastMsg := c.Messages[len(c.Messages)-1]
+	preview := lastMsg.Content
+	if utf8.RuneCountInString(preview) > 50 {
+		preview = string([]rune(preview)[:47]) + "..."
+	}
+	return preview
+}
+
+type focusState int
+
+const (
+	focusSidebar focusState = iota
+	focusChat
+)
+
 type model struct {
-	viewport    viewport.Model
-	textarea    textarea.Model
-	messages    []Message
-	client      *openai.Client
-	loading     bool
-	err         error
-	ready       bool
+	viewport        viewport.Model
+	textarea        textarea.Model
+	conversations   []Conversation
+	currentConvID   string
+	convList        list.Model
+	client          *openai.Client
+	loading         bool
+	err             error
+	ready           bool
+	focus           focusState
+	width           int
+	height          int
+	sidebarWidth    int
 }
 
 type responseMsg struct {
@@ -57,33 +93,82 @@ var (
 	loadingStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#FFB347")).
 			Italic(true)
+
+	sidebarStyle = lipgloss.NewStyle().
+			Border(lipgloss.NormalBorder(), false, true, false, false).
+			BorderForeground(lipgloss.Color("#444444"))
+
+	sidebarFocusedStyle = lipgloss.NewStyle().
+			Border(lipgloss.NormalBorder(), false, true, false, false).
+			BorderForeground(lipgloss.Color("#25A065"))
+
+	chatStyle = lipgloss.NewStyle().
+			PaddingLeft(1)
+
+	helpStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#666666")).
+			Italic(true)
 )
+
+func generateConvID() string {
+	return fmt.Sprintf("conv_%d", time.Now().Unix())
+}
+
+func newConversation(title string) Conversation {
+	return Conversation{
+		ID:       generateConvID(),
+		Name:     title,
+		Messages: []Message{},
+		Created:  time.Now(),
+	}
+}
 
 func initialModel() model {
 	ta := textarea.New()
 	ta.Placeholder = "Type your message..."
-	ta.Focus()
 	ta.Prompt = "┃ "
 	ta.CharLimit = 2000
-	ta.SetWidth(80)
+	ta.SetWidth(50)
 	ta.SetHeight(3)
 	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
 	ta.ShowLineNumbers = false
 
-	vp := viewport.New(80, 20)
-	vp.SetContent("Welcome to the AI Chat Interface!\nType your message below and press Enter to send.\n\n")
+	vp := viewport.New(50, 20)
+	vp.SetContent("Welcome to the AI Chat Interface!\nSelect a conversation or create a new one to start chatting.\n\n")
 
 	client := openai.NewClient(os.Getenv("OPENAI_API_KEY"))
 
-	return model{
-		textarea:    ta,
-		viewport:    vp,
-		messages:    []Message{},
-		client:      client,
-		loading:     false,
-		err:         nil,
-		ready:       false,
+	// Create initial conversation
+	initialConv := newConversation("New Chat")
+	conversations := []Conversation{initialConv}
+
+	// Set up conversation list
+	items := make([]list.Item, len(conversations))
+	for i, conv := range conversations {
+		items[i] = conv
 	}
+
+	convList := list.New(items, list.NewDefaultDelegate(), 30, 20)
+	convList.Title = "Conversations"
+	convList.SetShowStatusBar(false)
+	convList.SetFilteringEnabled(false)
+	convList.SetShowHelp(false)
+
+	m := model{
+		textarea:      ta,
+		viewport:      vp,
+		conversations: conversations,
+		currentConvID: initialConv.ID,
+		convList:      convList,
+		client:        client,
+		loading:       false,
+		err:           nil,
+		ready:         false,
+		focus:         focusChat,
+		sidebarWidth:  30,
+	}
+
+	return m
 }
 
 func (m model) Init() tea.Cmd {
@@ -94,37 +179,86 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var (
 		tiCmd tea.Cmd
 		vpCmd tea.Cmd
+		clCmd tea.Cmd
 	)
-
-	m.textarea, tiCmd = m.textarea.Update(msg)
-	m.viewport, vpCmd = m.viewport.Update(msg)
 
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		chatWidth := msg.Width - m.sidebarWidth - 2
+		chatHeight := msg.Height - 6
+
 		if !m.ready {
-			m.viewport = viewport.New(msg.Width, msg.Height-6)
-			m.textarea.SetWidth(msg.Width - 4)
+			m.viewport = viewport.New(chatWidth, chatHeight)
+			m.textarea.SetWidth(chatWidth - 2)
+			m.convList.SetSize(m.sidebarWidth-2, chatHeight+3)
 			m.ready = true
 		} else {
-			m.viewport.Width = msg.Width
-			m.viewport.Height = msg.Height - 6
-			m.textarea.SetWidth(msg.Width - 4)
+			m.viewport.Width = chatWidth
+			m.viewport.Height = chatHeight
+			m.textarea.SetWidth(chatWidth - 2)
+			m.convList.SetSize(m.sidebarWidth-2, chatHeight+3)
 		}
+		m.updateViewport()
 
 	case tea.KeyMsg:
 		switch msg.Type {
 		case tea.KeyCtrlC, tea.KeyEsc:
 			return m, tea.Quit
+		case tea.KeyTab:
+			if m.focus == focusSidebar {
+				m.focus = focusChat
+				m.textarea.Focus()
+			} else {
+				m.focus = focusSidebar
+				m.textarea.Blur()
+			}
+		case tea.KeyCtrlN:
+			// Create new conversation
+			newConv := newConversation("New Chat")
+			m.conversations = append(m.conversations, newConv)
+			m.currentConvID = newConv.ID
+			m.updateConversationList()
+			m.updateViewport()
+			m.focus = focusChat
+			m.textarea.Focus()
 		case tea.KeyEnter:
-			if !m.loading && strings.TrimSpace(m.textarea.Value()) != "" {
+			if m.focus == focusSidebar {
+				// Switch to selected conversation
+				if selectedItem, ok := m.convList.SelectedItem().(Conversation); ok {
+					m.currentConvID = selectedItem.ID
+					m.updateViewport()
+					m.focus = focusChat
+					m.textarea.Focus()
+				}
+			} else if m.focus == focusChat && !m.loading && strings.TrimSpace(m.textarea.Value()) != "" {
+				// Send message
 				userMsg := Message{
 					Role:    "user",
 					Content: strings.TrimSpace(m.textarea.Value()),
 					Time:    time.Now(),
 				}
-				m.messages = append(m.messages, userMsg)
+				
+				// Add message to current conversation
+				for i := range m.conversations {
+					if m.conversations[i].ID == m.currentConvID {
+						m.conversations[i].Messages = append(m.conversations[i].Messages, userMsg)
+						// Update conversation title if it's the first message
+						if len(m.conversations[i].Messages) == 1 {
+							title := userMsg.Content
+							if utf8.RuneCountInString(title) > 30 {
+								title = string([]rune(title)[:27]) + "..."
+							}
+							m.conversations[i].Name = title
+						}
+						break
+					}
+				}
+				
 				m.loading = true
 				m.textarea.Reset()
+				m.updateConversationList()
 				m.updateViewport()
 				return m, m.sendMessage(userMsg.Content)
 			}
@@ -140,36 +274,84 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				Content: msg.content,
 				Time:    time.Now(),
 			}
-			m.messages = append(m.messages, assistantMsg)
+			// Add response to current conversation
+			for i := range m.conversations {
+				if m.conversations[i].ID == m.currentConvID {
+					m.conversations[i].Messages = append(m.conversations[i].Messages, assistantMsg)
+					break
+				}
+			}
 		}
+		m.updateConversationList()
 		m.updateViewport()
 	}
 
-	return m, tea.Batch(tiCmd, vpCmd)
+	// Update child components
+	if m.focus == focusChat {
+		m.textarea, tiCmd = m.textarea.Update(msg)
+	}
+	if m.focus == focusSidebar {
+		m.convList, clCmd = m.convList.Update(msg)
+	}
+	m.viewport, vpCmd = m.viewport.Update(msg)
+
+	return m, tea.Batch(tiCmd, vpCmd, clCmd)
+}
+
+func (m *model) updateConversationList() {
+	items := make([]list.Item, len(m.conversations))
+	for i, conv := range m.conversations {
+		items[i] = conv
+	}
+	m.convList.SetItems(items)
+	
+	// Select current conversation in list
+	for i, conv := range m.conversations {
+		if conv.ID == m.currentConvID {
+			m.convList.Select(i)
+			break
+		}
+	}
+}
+
+func (m *model) getCurrentConversation() *Conversation {
+	for i := range m.conversations {
+		if m.conversations[i].ID == m.currentConvID {
+			return &m.conversations[i]
+		}
+	}
+	return nil
 }
 
 func (m *model) updateViewport() {
 	var content strings.Builder
 	
-	content.WriteString("Welcome to the AI Chat Interface!\n")
-	content.WriteString("Type your message below and press Enter to send.\n")
-	content.WriteString("Press Ctrl+C or Esc to quit.\n\n")
-
-	for _, msg := range m.messages {
-		timeStr := msg.Time.Format("15:04:05")
-		
-		if msg.Role == "user" {
-			content.WriteString(messageStyle.Render(
-				userStyle.Render("You") + " " + 
-				lipgloss.NewStyle().Foreground(lipgloss.Color("#666666")).Render("["+timeStr+"]") + "\n" +
-				msg.Content + "\n\n",
-			))
-		} else {
-			content.WriteString(messageStyle.Render(
-				assistantStyle.Render("Assistant") + " " +
-				lipgloss.NewStyle().Foreground(lipgloss.Color("#666666")).Render("["+timeStr+"]") + "\n" +
-				msg.Content + "\n\n",
-			))
+	currentConv := m.getCurrentConversation()
+	if currentConv == nil || len(currentConv.Messages) == 0 {
+		content.WriteString("Welcome to the AI Chat Interface!\n")
+		content.WriteString("Start typing to begin a conversation.\n\n")
+		content.WriteString(helpStyle.Render("Controls:\n"))
+		content.WriteString(helpStyle.Render("• Tab - Switch between sidebar and chat\n"))
+		content.WriteString(helpStyle.Render("• Ctrl+N - New conversation\n"))
+		content.WriteString(helpStyle.Render("• Enter - Send message / Select conversation\n"))
+		content.WriteString(helpStyle.Render("• Ctrl+C / Esc - Quit\n\n"))
+	} else {
+		for _, msg := range currentConv.Messages {
+			timeStr := msg.Time.Format("15:04:05")
+			
+			if msg.Role == "user" {
+				content.WriteString(messageStyle.Render(
+					userStyle.Render("You") + " " + 
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#666666")).Render("["+timeStr+"]") + "\n" +
+					msg.Content + "\n\n",
+				))
+			} else {
+				content.WriteString(messageStyle.Render(
+					assistantStyle.Render("Assistant") + " " +
+					lipgloss.NewStyle().Foreground(lipgloss.Color("#666666")).Render("["+timeStr+"]") + "\n" +
+					msg.Content + "\n\n",
+				))
+			}
 		}
 	}
 
@@ -201,17 +383,21 @@ func (m model) sendMessage(content string) tea.Cmd {
 			},
 		}
 
-		for _, msg := range m.messages {
-			var role string
-			if msg.Role == "user" {
-				role = openai.ChatMessageRoleUser
-			} else {
-				role = openai.ChatMessageRoleAssistant
+		// Get current conversation messages
+		currentConv := m.getCurrentConversation()
+		if currentConv != nil {
+			for _, msg := range currentConv.Messages {
+				var role string
+				if msg.Role == "user" {
+					role = openai.ChatMessageRoleUser
+				} else {
+					role = openai.ChatMessageRoleAssistant
+				}
+				messages = append(messages, openai.ChatCompletionMessage{
+					Role:    role,
+					Content: msg.Content,
+				})
 			}
-			messages = append(messages, openai.ChatCompletionMessage{
-				Role:    role,
-				Content: msg.Content,
-			})
 		}
 
 		resp, err := m.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
@@ -237,12 +423,27 @@ func (m model) View() string {
 		return "\n  Initializing..."
 	}
 
-	return fmt.Sprintf(
-		"%s\n%s\n%s",
-		titleStyle.Render("AI Chat Interface"),
-		m.viewport.View(),
-		m.textarea.View(),
+	// Create sidebar
+	sidebarContent := m.convList.View()
+	var sidebar string
+	if m.focus == focusSidebar {
+		sidebar = sidebarFocusedStyle.Width(m.sidebarWidth).Height(m.height-1).Render(sidebarContent)
+	} else {
+		sidebar = sidebarStyle.Width(m.sidebarWidth).Height(m.height-1).Render(sidebarContent)
+	}
+
+	// Create chat area
+	chatWidth := m.width - m.sidebarWidth - 2
+	chatHeader := titleStyle.Width(chatWidth).Render("AI Chat Interface")
+	chatViewport := m.viewport.View()
+	chatInput := m.textarea.View()
+	
+	chatArea := chatStyle.Width(chatWidth).Render(
+		fmt.Sprintf("%s\n%s\n%s", chatHeader, chatViewport, chatInput),
 	)
+
+	// Combine sidebar and chat area
+	return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, chatArea)
 }
 
 func main() {
