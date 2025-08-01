@@ -1,16 +1,20 @@
-package main
+package storage
 
 import (
 	"database/sql"
 	"time"
 
+	"cog/internal/models"
+
 	_ "modernc.org/sqlite"
 )
 
+// Database handles SQLite operations for conversations and messages
 type Database struct {
 	db *sql.DB
 }
 
+// NewDatabase creates a new database connection and initializes tables
 func NewDatabase(dbPath string) (*Database, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -57,7 +61,8 @@ func (d *Database) createTables() error {
 	return nil
 }
 
-func (d *Database) SaveConversation(conv Conversation) error {
+// SaveConversation saves or updates a conversation and all its messages
+func (d *Database) SaveConversation(conv models.Conversation) error {
 	tx, err := d.db.Begin()
 	if err != nil {
 		return err
@@ -93,7 +98,8 @@ func (d *Database) SaveConversation(conv Conversation) error {
 	return tx.Commit()
 }
 
-func (d *Database) LoadConversations() ([]Conversation, error) {
+// LoadConversations loads all conversations from the database
+func (d *Database) LoadConversations() ([]models.Conversation, error) {
 	rows, err := d.db.Query(`
 		SELECT id, name, created_at, updated_at
 		FROM conversations
@@ -103,9 +109,9 @@ func (d *Database) LoadConversations() ([]Conversation, error) {
 	}
 	defer rows.Close()
 
-	var conversations []Conversation
+	var conversations []models.Conversation
 	for rows.Next() {
-		var conv Conversation
+		var conv models.Conversation
 		var updatedAt time.Time
 		err := rows.Scan(&conv.ID, &conv.Name, &conv.Created, &updatedAt)
 		if err != nil {
@@ -125,7 +131,7 @@ func (d *Database) LoadConversations() ([]Conversation, error) {
 	return conversations, nil
 }
 
-func (d *Database) loadMessages(conversationID string) ([]Message, error) {
+func (d *Database) loadMessages(conversationID string) ([]models.Message, error) {
 	rows, err := d.db.Query(`
 		SELECT role, content, created_at
 		FROM messages
@@ -137,9 +143,9 @@ func (d *Database) loadMessages(conversationID string) ([]Message, error) {
 	}
 	defer rows.Close()
 
-	var messages []Message
+	var messages []models.Message
 	for rows.Next() {
-		var msg Message
+		var msg models.Message
 		err := rows.Scan(&msg.Role, &msg.Content, &msg.Time)
 		if err != nil {
 			return nil, err
@@ -150,11 +156,13 @@ func (d *Database) loadMessages(conversationID string) ([]Message, error) {
 	return messages, nil
 }
 
+// DeleteConversation removes a conversation and all its messages
 func (d *Database) DeleteConversation(conversationID string) error {
 	_, err := d.db.Exec("DELETE FROM conversations WHERE id = ?", conversationID)
 	return err
 }
 
+// Close closes the database connection
 func (d *Database) Close() error {
 	return d.db.Close()
 }

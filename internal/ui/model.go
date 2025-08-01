@@ -1,14 +1,14 @@
-package main
+package ui
 
 import (
 	"context"
 	"fmt"
-	"log"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"cog/internal/models"
+	"cog/internal/storage"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/textarea"
@@ -18,114 +18,39 @@ import (
 	"github.com/sashabaranov/go-openai"
 )
 
-type Message struct {
-	Role    string
-	Content string
-	Time    time.Time
-}
-
-type Conversation struct {
-	ID       string
-	Name     string
-	Messages []Message
-	Created  time.Time
-}
-
-func (c Conversation) FilterValue() string { return c.Name }
-func (c Conversation) Title() string       { return c.Name }
-func (c Conversation) Description() string {
-	if len(c.Messages) == 0 {
-		return "New conversation"
-	}
-	lastMsg := c.Messages[len(c.Messages)-1]
-	preview := lastMsg.Content
-	if utf8.RuneCountInString(preview) > 50 {
-		preview = string([]rune(preview)[:47]) + "..."
-	}
-	return preview
-}
-
-type focusState int
+type FocusState int
 
 const (
-	focusSidebar focusState = iota
-	focusChat
+	FocusSidebar FocusState = iota
+	FocusChat
 )
 
-type model struct {
+// Model represents the main application state
+type Model struct {
 	viewport        viewport.Model
 	textarea        textarea.Model
-	conversations   []Conversation
+	conversations   []models.Conversation
 	currentConvID   string
 	convList        list.Model
 	client          *openai.Client
-	db              *Database
+	db              *storage.Database
 	loading         bool
 	err             error
 	ready           bool
-	focus           focusState
+	focus           FocusState
 	width           int
 	height          int
 	sidebarWidth    int
 }
 
-type responseMsg struct {
-	content string
-	err     error
+// ResponseMsg represents a message from the OpenAI API
+type ResponseMsg struct {
+	Content string
+	Err     error
 }
 
-var (
-	titleStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFFDF5")).
-			Background(lipgloss.Color("#25A065")).
-			Padding(0, 1)
-
-	userStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#04B575")).
-			Bold(true)
-
-	assistantStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFB347")).
-			Bold(true)
-
-	messageStyle = lipgloss.NewStyle().
-			PaddingLeft(2).
-			MarginBottom(1)
-
-	loadingStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFB347")).
-			Italic(true)
-
-	sidebarStyle = lipgloss.NewStyle().
-			Border(lipgloss.NormalBorder(), false, true, false, false).
-			BorderForeground(lipgloss.Color("#444444"))
-
-	sidebarFocusedStyle = lipgloss.NewStyle().
-			Border(lipgloss.NormalBorder(), false, true, false, false).
-			BorderForeground(lipgloss.Color("#25A065"))
-
-	chatStyle = lipgloss.NewStyle().
-			PaddingLeft(1)
-
-	helpStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#666666")).
-			Italic(true)
-)
-
-func generateConvID() string {
-	return fmt.Sprintf("conv_%d", time.Now().Unix())
-}
-
-func newConversation(title string) Conversation {
-	return Conversation{
-		ID:       generateConvID(),
-		Name:     title,
-		Messages: []Message{},
-		Created:  time.Now(),
-	}
-}
-
-func initialModel() model {
+// NewModel creates a new UI model
+func NewModel(client *openai.Client, db *storage.Database) *Model {
 	ta := textarea.New()
 	ta.Placeholder = "Type your message..."
 	ta.Prompt = "┃ "
@@ -138,37 +63,19 @@ func initialModel() model {
 	vp := viewport.New(50, 20)
 	vp.SetContent("Welcome to the AI Chat Interface!\nSelect a conversation or create a new one to start chatting.\n\n")
 
-	client := openai.NewClient(os.Getenv("OPENAI_API_KEY"))
-
-	// Initialize database
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		log.Fatal("Failed to get user home directory:", err)
-	}
-	dbPath := filepath.Join(homeDir, ".cog", "conversations.db")
-	
-	// Create directory if it doesn't exist
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
-		log.Fatal("Failed to create database directory:", err)
-	}
-
-	db, err := NewDatabase(dbPath)
-	if err != nil {
-		log.Fatal("Failed to initialize database:", err)
-	}
-
 	// Load conversations from database
 	conversations, err := db.LoadConversations()
 	if err != nil {
-		log.Fatal("Failed to load conversations:", err)
+		// Handle error - could be logged or shown to user
+		conversations = []models.Conversation{}
 	}
 
 	// If no conversations exist, create a default one
 	if len(conversations) == 0 {
-		initialConv := newConversation("New Chat")
-		conversations = []Conversation{initialConv}
+		initialConv := NewConversation("New Chat")
+		conversations = []models.Conversation{initialConv}
 		if err := db.SaveConversation(initialConv); err != nil {
-			log.Printf("Failed to save initial conversation: %v", err)
+			// Handle error - could be logged
 		}
 	}
 
@@ -190,7 +97,7 @@ func initialModel() model {
 		currentConvID = conversations[0].ID
 	}
 
-	m := model{
+	return &Model{
 		textarea:      ta,
 		viewport:      vp,
 		conversations: conversations,
@@ -201,18 +108,33 @@ func initialModel() model {
 		loading:       false,
 		err:           nil,
 		ready:         false,
-		focus:         focusChat,
+		focus:         FocusChat,
 		sidebarWidth:  30,
 	}
-
-	return m
 }
 
-func (m model) Init() tea.Cmd {
+// Init initializes the model
+func (m Model) Init() tea.Cmd {
 	return tea.Batch(textarea.Blink, tea.EnterAltScreen)
 }
 
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+// GenerateConvID generates a unique conversation ID
+func GenerateConvID() string {
+	return fmt.Sprintf("conv_%d", time.Now().Unix())
+}
+
+// NewConversation creates a new conversation
+func NewConversation(title string) models.Conversation {
+	return models.Conversation{
+		ID:       GenerateConvID(),
+		Name:     title,
+		Messages: []models.Message{},
+		Created:  time.Now(),
+	}
+}
+
+// Update handles UI events and state changes
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var (
 		tiCmd tea.Cmd
 		vpCmd tea.Cmd
@@ -244,16 +166,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyCtrlC, tea.KeyEsc:
 			return m, tea.Quit
 		case tea.KeyTab:
-			if m.focus == focusSidebar {
-				m.focus = focusChat
+			if m.focus == FocusSidebar {
+				m.focus = FocusChat
 				m.textarea.Focus()
 			} else {
-				m.focus = focusSidebar
+				m.focus = FocusSidebar
 				m.textarea.Blur()
 			}
 		case tea.KeyCtrlN:
 			// Create new conversation
-			newConv := newConversation("New Chat")
+			newConv := NewConversation("New Chat")
 			m.conversations = append(m.conversations, newConv)
 			m.currentConvID = newConv.ID
 			
@@ -264,20 +186,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			
 			m.updateConversationList()
 			m.updateViewport()
-			m.focus = focusChat
+			m.focus = FocusChat
 			m.textarea.Focus()
 		case tea.KeyEnter:
-			if m.focus == focusSidebar {
+			if m.focus == FocusSidebar {
 				// Switch to selected conversation
-				if selectedItem, ok := m.convList.SelectedItem().(Conversation); ok {
+				if selectedItem, ok := m.convList.SelectedItem().(models.Conversation); ok {
 					m.currentConvID = selectedItem.ID
 					m.updateViewport()
-					m.focus = focusChat
+					m.focus = FocusChat
 					m.textarea.Focus()
 				}
-			} else if m.focus == focusChat && !m.loading && strings.TrimSpace(m.textarea.Value()) != "" {
+			} else if m.focus == FocusChat && !m.loading && strings.TrimSpace(m.textarea.Value()) != "" {
 				// Send message
-				userMsg := Message{
+				userMsg := models.Message{
 					Role:    "user",
 					Content: strings.TrimSpace(m.textarea.Value()),
 					Time:    time.Now(),
@@ -312,14 +234,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-	case responseMsg:
+	case ResponseMsg:
 		m.loading = false
-		if msg.err != nil {
-			m.err = msg.err
+		if msg.Err != nil {
+			m.err = msg.Err
 		} else {
-			assistantMsg := Message{
+			assistantMsg := models.Message{
 				Role:    "assistant",
-				Content: msg.content,
+				Content: msg.Content,
 				Time:    time.Now(),
 			}
 			// Add response to current conversation
@@ -340,10 +262,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	// Update child components
-	if m.focus == focusChat {
+	if m.focus == FocusChat {
 		m.textarea, tiCmd = m.textarea.Update(msg)
 	}
-	if m.focus == focusSidebar {
+	if m.focus == FocusSidebar {
 		m.convList, clCmd = m.convList.Update(msg)
 	}
 	m.viewport, vpCmd = m.viewport.Update(msg)
@@ -351,7 +273,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(tiCmd, vpCmd, clCmd)
 }
 
-func (m *model) updateConversationList() {
+func (m *Model) updateConversationList() {
 	items := make([]list.Item, len(m.conversations))
 	for i, conv := range m.conversations {
 		items[i] = conv
@@ -367,7 +289,7 @@ func (m *model) updateConversationList() {
 	}
 }
 
-func (m *model) getCurrentConversation() *Conversation {
+func (m *Model) getCurrentConversation() *models.Conversation {
 	for i := range m.conversations {
 		if m.conversations[i].ID == m.currentConvID {
 			return &m.conversations[i]
@@ -376,31 +298,31 @@ func (m *model) getCurrentConversation() *Conversation {
 	return nil
 }
 
-func (m *model) updateViewport() {
+func (m *Model) updateViewport() {
 	var content strings.Builder
 	
 	currentConv := m.getCurrentConversation()
 	if currentConv == nil || len(currentConv.Messages) == 0 {
 		content.WriteString("Welcome to the AI Chat Interface!\n")
 		content.WriteString("Start typing to begin a conversation.\n\n")
-		content.WriteString(helpStyle.Render("Controls:\n"))
-		content.WriteString(helpStyle.Render("• Tab - Switch between sidebar and chat\n"))
-		content.WriteString(helpStyle.Render("• Ctrl+N - New conversation\n"))
-		content.WriteString(helpStyle.Render("• Enter - Send message / Select conversation\n"))
-		content.WriteString(helpStyle.Render("• Ctrl+C / Esc - Quit\n\n"))
+		content.WriteString(HelpStyle.Render("Controls:\n"))
+		content.WriteString(HelpStyle.Render("• Tab - Switch between sidebar and chat\n"))
+		content.WriteString(HelpStyle.Render("• Ctrl+N - New conversation\n"))
+		content.WriteString(HelpStyle.Render("• Enter - Send message / Select conversation\n"))
+		content.WriteString(HelpStyle.Render("• Ctrl+C / Esc - Quit\n\n"))
 	} else {
 		for _, msg := range currentConv.Messages {
 			timeStr := msg.Time.Format("15:04:05")
 			
 			if msg.Role == "user" {
-				content.WriteString(messageStyle.Render(
-					userStyle.Render("You") + " " + 
+				content.WriteString(MessageStyle.Render(
+					UserStyle.Render("You") + " " + 
 					lipgloss.NewStyle().Foreground(lipgloss.Color("#666666")).Render("["+timeStr+"]") + "\n" +
 					msg.Content + "\n\n",
 				))
 			} else {
-				content.WriteString(messageStyle.Render(
-					assistantStyle.Render("Assistant") + " " +
+				content.WriteString(MessageStyle.Render(
+					AssistantStyle.Render("Assistant") + " " +
 					lipgloss.NewStyle().Foreground(lipgloss.Color("#666666")).Render("["+timeStr+"]") + "\n" +
 					msg.Content + "\n\n",
 				))
@@ -409,13 +331,13 @@ func (m *model) updateViewport() {
 	}
 
 	if m.loading {
-		content.WriteString(messageStyle.Render(
-			loadingStyle.Render("Assistant is typing...") + "\n",
+		content.WriteString(MessageStyle.Render(
+			LoadingStyle.Render("Assistant is typing...") + "\n",
 		))
 	}
 
 	if m.err != nil {
-		content.WriteString(messageStyle.Render(
+		content.WriteString(MessageStyle.Render(
 			lipgloss.NewStyle().Foreground(lipgloss.Color("#FF6B6B")).Render("Error: " + m.err.Error() + "\n"),
 		))
 		m.err = nil
@@ -425,7 +347,7 @@ func (m *model) updateViewport() {
 	m.viewport.GotoBottom()
 }
 
-func (m model) sendMessage(content string) tea.Cmd {
+func (m Model) sendMessage(content string) tea.Cmd {
 	return func() tea.Msg {
 		ctx := context.Background()
 		
@@ -460,18 +382,19 @@ func (m model) sendMessage(content string) tea.Cmd {
 		})
 
 		if err != nil {
-			return responseMsg{err: err}
+			return ResponseMsg{Err: err}
 		}
 
 		if len(resp.Choices) == 0 {
-			return responseMsg{err: fmt.Errorf("no response from API")}
+			return ResponseMsg{Err: fmt.Errorf("no response from API")}
 		}
 
-		return responseMsg{content: resp.Choices[0].Message.Content}
+		return ResponseMsg{Content: resp.Choices[0].Message.Content}
 	}
 }
 
-func (m model) View() string {
+// View renders the UI
+func (m Model) View() string {
 	if !m.ready {
 		return "\n  Initializing..."
 	}
@@ -479,36 +402,22 @@ func (m model) View() string {
 	// Create sidebar
 	sidebarContent := m.convList.View()
 	var sidebar string
-	if m.focus == focusSidebar {
-		sidebar = sidebarFocusedStyle.Width(m.sidebarWidth).Height(m.height-1).Render(sidebarContent)
+	if m.focus == FocusSidebar {
+		sidebar = SidebarFocusedStyle.Width(m.sidebarWidth).Height(m.height-1).Render(sidebarContent)
 	} else {
-		sidebar = sidebarStyle.Width(m.sidebarWidth).Height(m.height-1).Render(sidebarContent)
+		sidebar = SidebarStyle.Width(m.sidebarWidth).Height(m.height-1).Render(sidebarContent)
 	}
 
 	// Create chat area
 	chatWidth := m.width - m.sidebarWidth - 2
-	chatHeader := titleStyle.Width(chatWidth).Render("AI Chat Interface")
+	chatHeader := TitleStyle.Width(chatWidth).Render("AI Chat Interface")
 	chatViewport := m.viewport.View()
 	chatInput := m.textarea.View()
 	
-	chatArea := chatStyle.Width(chatWidth).Render(
+	chatArea := ChatStyle.Width(chatWidth).Render(
 		fmt.Sprintf("%s\n%s\n%s", chatHeader, chatViewport, chatInput),
 	)
 
 	// Combine sidebar and chat area
 	return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, chatArea)
-}
-
-func main() {
-	if os.Getenv("OPENAI_API_KEY") == "" {
-		log.Fatal("OPENAI_API_KEY environment variable is required")
-	}
-
-	model := initialModel()
-	defer model.db.Close()
-
-	p := tea.NewProgram(model, tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
-		log.Fatal(err)
-	}
 }
